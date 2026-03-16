@@ -1,5 +1,5 @@
 import { subHours } from "date-fns";
-import { Op } from "sequelize";
+import { Op, Transaction } from "sequelize";
 import { ImportState, ImportTaskState } from "@shared/types";
 import Logger from "@server/logging/Logger";
 import { Import, ImportTask } from "@server/models";
@@ -57,9 +57,30 @@ export default class ErrorTimedOutImportsTask extends CronTask {
 
               // this import could have been seen before in another import_task.
               if (!importsErrored[associatedImport.id]) {
-                associatedImport.state = ImportState.Errored;
-                associatedImport.error = "Timed out";
-                await associatedImport.save({ transaction });
+                // Lock to prevent concurrent state transitions.
+                const lockedImport = await Import.unscoped().findByPk(
+                  associatedImport.id,
+                  {
+                    transaction,
+                    lock: Transaction.LOCK.UPDATE,
+                  }
+                );
+
+                if (!lockedImport) {
+                  return;
+                }
+
+                // Only mark as errored if still in a non-terminal state.
+                if (
+                  lockedImport.state !== ImportState.Created &&
+                  lockedImport.state !== ImportState.InProgress
+                ) {
+                  return;
+                }
+
+                lockedImport.state = ImportState.Errored;
+                lockedImport.error = "Timed out";
+                await lockedImport.save({ transaction });
                 importsErrored[associatedImport.id] = true;
               }
             });

@@ -211,7 +211,21 @@ export default abstract class APIImportTask<
 
     // All tasks for this import have been processed.
     await sequelize.transaction(async (transaction) => {
-      const associatedImport = importTask.import;
+      // Lock to prevent concurrent state transitions.
+      const associatedImport = await Import.findByPk(importTask.importId, {
+        rejectOnEmpty: true,
+        transaction,
+        lock: Transaction.LOCK.UPDATE,
+      });
+
+      // Only transition to Processed if still in a non-terminal state.
+      if (
+        associatedImport.state === ImportState.Errored ||
+        associatedImport.state === ImportState.Canceled
+      ) {
+        return;
+      }
+
       associatedImport.state = ImportState.Processed;
       await associatedImport.saveWithCtx(
         createContext({
