@@ -1,5 +1,5 @@
 import type { InferCreationAttributes } from "sequelize";
-import { Op } from "sequelize";
+import { Op, UniqueConstraintError } from "sequelize";
 import type { UserRole } from "@shared/types";
 import InviteAcceptedEmail from "@server/emails/templates/InviteAcceptedEmail";
 import {
@@ -254,6 +254,46 @@ export default async function userProvisioner(
     };
   } catch (err) {
     await transaction.rollback();
+
+    // Handle race condition: another concurrent request created the same user.
+    // Only handle the specific (teamId, email) constraint to avoid masking
+    // unrelated unique violations.
+    if (err instanceof UniqueConstraintError && err.fields?.["teamId"]) {
+      const existingUser = await User.scope(["withTeam"]).findOne({
+        where: {
+          email: { [Op.iLike]: email },
+          teamId,
+        },
+      });
+
+      if (existingUser) {
+        Logger.info(
+          "authentication",
+          "Concurrent user creation race resolved",
+          {
+            teamId,
+            email,
+            userId: existingUser.id,
+          }
+        );
+
+        let userAuth: UserAuthentication | null = null;
+
+        if (authentication) {
+          userAuth = await existingUser.$create<UserAuthentication>(
+            "authentication",
+            authentication
+          );
+        }
+
+        return {
+          user: existingUser,
+          authentication: userAuth,
+          isNewUser: false,
+        };
+      }
+    }
+
     throw err;
   }
 }
